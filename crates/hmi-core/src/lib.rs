@@ -2,6 +2,9 @@
 
 extern crate alloc;
 
+pub mod living;
+pub mod sounds;
+
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
 use core::fmt::Write as _;
 

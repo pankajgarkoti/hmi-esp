@@ -11,6 +11,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "espidf")]
+mod world_store;
+
+#[cfg(target_os = "espidf")]
 mod firmware {
     use std::{
         ffi::CString,
@@ -19,13 +22,18 @@ mod firmware {
         io::{Read, Seek, SeekFrom, Write},
         path::{Path, PathBuf},
         string::String,
+        sync::{
+            atomic::{AtomicU8, Ordering},
+            mpsc, Arc,
+        },
         thread,
         time::{Duration, Instant},
         vec::Vec,
     };
 
+    use crate::world_store::WorldStore;
     use anyhow::{anyhow, Context};
-    use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
+    use embedded_svc::wifi::{ClientConfiguration, Configuration};
     use esp_idf_hal::{
         delay::Ets,
         gpio::{PinDriver, Pull},
@@ -36,11 +44,13 @@ mod firmware {
     use esp_idf_svc::{
         eventloop::EspSystemEventLoop,
         log::EspLogger,
-        nvs::EspDefaultNvsPartition,
-        wifi::{BlockingWifi, EspWifi},
+        nvs::{EspDefaultNvsPartition, EspNvs},
+        wifi::EspWifi,
     };
+    use hmi_core::living::{self, LivingDisplay, Rule, Settings};
+    use hmi_core::sounds::{Cue, SoundDetector};
     use hmi_core::{
-        render_dashboard, BatteryTelemetry, Button, ButtonEngine, ClockTelemetry, DashboardState,
+        BatteryTelemetry, Button, ButtonEngine, ClockTelemetry, DashboardState,
         EnvironmentTelemetry, FileEntry, FileKind, Health, UiAction, View,
     };
     use log::{error, info, warn};
@@ -65,6 +75,7 @@ mod firmware {
             minute: *mut u8,
             second: *mut u8,
         ) -> i32;
+        fn hmi_board_poll_command() -> i32;
     }
 
     const WIFI_SSID: &str = env!("HMI_WIFI_SSID", "set WIFI_SSID in the ignored .env.local");
@@ -78,7 +89,7 @@ mod firmware {
     // full-duplex example services read/write continuously; a 20 ms sleep here
     // cut both capture and playback throughput roughly in half.
     const LOOP_MS: u64 = 1;
-    const DISPLAY_MS: u64 = 250;
+    const DISPLAY_MS: u64 = 62;
     const ENV_MS: u64 = 2_000;
     const AUDIO_EVENT_MS: u64 = 1_000;
     const AUDIO_HISTORY_MS: u64 = 100;
@@ -95,6 +106,21 @@ mod firmware {
 
         let peripherals = Peripherals::take().context("take ESP-IDF peripherals")?;
         let pins = peripherals.pins;
+        let nvs = EspDefaultNvsPartition::take()?;
+        let preferences = EspNvs::new(nvs.clone(), "living", true).ok();
+        let settings = preferences
+            .as_ref()
+            .and_then(|p| p.get_u32("settings").ok().flatten())
+            .map(Settings::decode)
+            .unwrap_or_default();
+        let mut living = LivingDisplay::new(settings, unsafe { esp_idf_sys::esp_random() });
+        let mut sounds = SoundDetector::new();
+        if let Some(prefs) = preferences.as_ref() {
+            let mut blob = [0u8; 1024];
+            if let Ok(Some(bytes)) = prefs.get_blob("time_sound", &mut blob) {
+                sounds.load_template(bytes);
+            }
+        }
 
         let spi_config = SpiConfig::new().baudrate(24.MHz().into());
         let spi_driver_config = SpiDriverConfig::new().dma(Dma::Auto(16 * 1024));
@@ -119,7 +145,8 @@ mod firmware {
             .map_err(|_| anyhow!("ST7305 startup clear failed"))?;
         let mut state = DashboardState::default();
         state.record(0, "BOOT", "display and input ready");
-        render_dashboard(&mut framebuffer, &state).expect("framebuffer is infallible");
+        living::render(&mut framebuffer.landscape(), &living, &state, 0)
+            .expect("framebuffer is infallible");
         display
             .flush(&framebuffer)
             .map_err(|_| anyhow!("ST7305 startup dashboard failed"))?;
@@ -136,6 +163,43 @@ mod firmware {
         }
 
         let board_ready = unsafe { hmi_board_init() };
+        living.voice_ready = board_ready & HMI_BOARD_AUDIO_READY != 0;
+        if !living.voice_ready {
+            living.sound_message = "MIC UNAVAILABLE / KEY SHOWS TIME";
+        }
+        let sd_feedback = Arc::new(AtomicU8::new(0));
+        let world_writer = if board_ready & HMI_BOARD_SD_READY != 0 {
+            let store = WorldStore::new("/sdcard/living");
+            let (tx, rx) = mpsc::sync_channel::<(Rule, Vec<u8>)>(4);
+            let status = sd_feedback.clone();
+            thread::Builder::new()
+                .name("world-save".into())
+                .stack_size(8192)
+                .spawn(move || {
+                    let mut checksums = [0u32; 16];
+                    while let Ok((rule, bytes)) = rx.recv() {
+                        let crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+                        if checksums[rule as usize] == crc {
+                            continue;
+                        }
+                        match store.save(rule, &bytes) {
+                            Ok(()) => {
+                                checksums[rule as usize] = crc;
+                                status.store(1, Ordering::Relaxed);
+                                info!("SD saved {}", rule.name());
+                            }
+                            Err(err) => {
+                                status.store(2, Ordering::Relaxed);
+                                warn!("SD snapshot {}: {err}", rule.name());
+                            }
+                        }
+                    }
+                })?;
+            living.sd_status = "SD READY";
+            Some(tx)
+        } else {
+            None
+        };
         state.audio.health = health_from_bit(board_ready, HMI_BOARD_AUDIO_READY);
         state.environment.health = health_from_bit(board_ready, HMI_BOARD_ENV_READY);
         state.battery.health = health_from_bit(board_ready, HMI_BOARD_BATTERY_READY);
@@ -146,7 +210,7 @@ mod firmware {
             sample_environment(&mut state, 0);
         }
 
-        let mut wifi = match start_wifi(peripherals.modem) {
+        let mut wifi = match start_wifi(peripherals.modem, nvs) {
             Ok(wifi) => {
                 state.wifi.health = Health::Stale;
                 state.wifi.ssid = WIFI_SSID.into();
@@ -163,6 +227,17 @@ mod firmware {
         let timezone = CString::new(TIMEZONE).expect("static timezone contains no NUL");
         if unsafe { hmi_board_time_init(timezone.as_ptr()) } != 0 {
             warn!("network time initialization failed");
+        }
+        // Reserve radio/DMA allocations before loading all sixteen worlds. Those
+        // buffers otherwise compete with Wi-Fi for scarce internal RAM at boot.
+        if board_ready & HMI_BOARD_SD_READY != 0 {
+            let store = WorldStore::new("/sdcard/living");
+            for rule in Rule::ALL {
+                if let Some(world) = store.load(rule) {
+                    info!("restored {} generation {}", rule.name(), world.generation);
+                    living.restore_world(world);
+                }
+            }
         }
 
         let boot = Instant::now();
@@ -184,6 +259,10 @@ mod firmware {
         let mut loop_window_ms = 0u64;
         let mut display_pending = false;
         let mut display_pending_since = 0u64;
+        let mut pending_worlds = 1u16 << living.settings.rule as u8;
+        let mut last_checkpoint = 0;
+        let mut previous_rule = living.settings.rule;
+        let mut previous_surface = living.surface(0);
 
         loop {
             let loop_started = Instant::now();
@@ -191,20 +270,56 @@ mod firmware {
             state.runtime.uptime_ms = now_ms;
             state.environment.sample_age_ms = now_ms.saturating_sub(last_env_success);
 
-            sample_button(
-                &mut buttons,
-                &mut state,
-                Button::Boot,
-                boot_button.is_low(),
-                now_ms,
-            );
-            sample_button(
-                &mut buttons,
-                &mut state,
-                Button::Key,
-                key_button.is_low(),
-                now_ms,
-            );
+            let command = unsafe { hmi_board_poll_command() };
+            let debug_event = match command {
+                98 => Some((Button::Boot, hmi_core::Gesture::Click)),
+                66 => Some((Button::Boot, hmi_core::Gesture::LongPress)),
+                107 => Some((Button::Key, hmi_core::Gesture::Click)),
+                75 => Some((Button::Key, hmi_core::Gesture::LongPress)),
+                _ => None,
+            }
+            .map(|(button, gesture)| hmi_core::InputEvent {
+                button,
+                gesture,
+                held_ms: 700,
+            });
+            if command == 116 {
+                living.show_clock(now_ms);
+            }
+            if command == 115 {
+                info!("STATUS rule={:?} gen={} surface={:?} mic={} sound_distance={} segments={} frames={} saved={}",living.settings.rule,
+                    living.automaton.generation,living.surface(now_ms),living.mic_peak,sounds.last_distance,sounds.segments,sounds.last_frames,living.sd_status);
+            }
+            let events = [
+                buttons.sample(Button::Boot, boot_button.is_low(), now_ms),
+                buttons.sample(Button::Key, key_button.is_low(), now_ms),
+                debug_event,
+            ];
+            for event in events.into_iter().flatten() {
+                let button = event.button;
+                info!("{} {:?}", button.label(), event.gesture);
+                let reseeding = living.surface(now_ms) == living::Surface::Settings
+                    && living.selected == 5
+                    && button == Button::Boot
+                    && event.gesture == hmi_core::Gesture::LongPress;
+                if living.input(event, now_ms) {
+                    if let Some(prefs) = preferences.as_ref() {
+                        if let Err(err) = prefs.set_u32("settings", living.settings.encode()) {
+                            warn!("settings save failed: {err}");
+                        }
+                    }
+                }
+                if reseeding {
+                    pending_worlds |= 1 << living.settings.rule as u8;
+                }
+                state.refresh_requested = true;
+            }
+            if living.learn_requested {
+                living.learn_requested = false;
+                sounds.learn_next();
+                living.sound_message = "LISTENING: SAY TIME ONCE";
+                info!("sound learning started: say time once");
+            }
             for button in Button::ALL {
                 let stats = &mut state.buttons[button.index()];
                 stats.held_ms = buttons.held_ms(button, now_ms);
@@ -240,6 +355,37 @@ mod firmware {
 
             if board_ready & HMI_BOARD_AUDIO_READY != 0 {
                 let captured = sample_audio(&mut state, &mut audio_samples, now_ms);
+                if captured {
+                    living.audio(&audio_samples);
+                    if let Some(cue) = sounds.stereo(&audio_samples) {
+                        match cue {
+                            Cue::Learned => {
+                                living.sound_message = "TIME SOUND LEARNED";
+                                if let Some(prefs) = preferences.as_ref() {
+                                    if let Err(err) =
+                                        prefs.set_blob("time_sound", &sounds.export_template())
+                                    {
+                                        warn!("sound template save failed: {err}");
+                                        living.sound_message = "LEARNED / SAVE FAILED";
+                                    }
+                                }
+                                info!("personal time sound learned");
+                            }
+                            Cue::Snap | Cue::Time => {
+                                if living.voice_time(now_ms) {
+                                    info!(
+                                        "sound cue {cue:?} distance={:.3}; clock overlay gen={}",
+                                        sounds.last_distance, living.automaton.generation
+                                    );
+                                    state.refresh_requested = true;
+                                }
+                            }
+                        }
+                    }
+                    if !sounds.learning() && living.sound_message == "LISTENING: SAY TIME ONCE" {
+                        living.sound_message = "NO CUE HEARD / HOLD TO TRY AGAIN";
+                    }
+                }
                 if captured && state.recording {
                     if let Err(err) = media.append_recording(&audio_samples, &mut state) {
                         warn!("WAV write failed: {err:#}");
@@ -293,6 +439,14 @@ mod firmware {
             update_runtime(&mut state);
             if now_ms.saturating_sub(last_runtime_event) >= RUNTIME_EVENT_MS {
                 last_runtime_event = now_ms;
+                info!(
+                    "living gen={} surface={:?} mic={} heap={} psram={}",
+                    living.automaton.generation,
+                    living.surface(now_ms),
+                    living.mic_peak,
+                    state.runtime.free_heap,
+                    state.runtime.free_psram
+                );
                 state.record(
                     now_ms,
                     "PIPE",
@@ -306,12 +460,52 @@ mod firmware {
                 );
             }
             event_recorder.sync(&mut state);
+            living.advance(now_ms);
+            if living.settings.rule != previous_rule {
+                pending_worlds |= (1 << previous_rule as u8) | (1 << living.settings.rule as u8);
+                previous_rule = living.settings.rule;
+                info!(
+                    "world {} resumed at generation {}",
+                    previous_rule.name(),
+                    living.automaton.generation
+                );
+            }
+            let surface = living.surface(now_ms);
+            if surface != previous_surface {
+                info!("surface {surface:?} gen={}", living.automaton.generation);
+                previous_surface = surface;
+            }
+            if now_ms.saturating_sub(last_checkpoint) >= 30_000 {
+                pending_worlds = u16::MAX;
+                last_checkpoint = now_ms;
+            }
+            if let Some(writer) = world_writer.as_ref() {
+                for rule in Rule::ALL {
+                    let bit = 1 << rule as u8;
+                    if pending_worlds & bit == 0 {
+                        continue;
+                    }
+                    if let Some(world) = living.world(rule) {
+                        if writer.try_send((rule, world.snapshot())).is_err() {
+                            break;
+                        }
+                    }
+                    pending_worlds &= !bit;
+                    break;
+                }
+                living.sd_status = match sd_feedback.load(Ordering::Relaxed) {
+                    1 => "SD WORLDS SAVED",
+                    2 => "SD SAVE FAILED",
+                    _ => "SD READY",
+                };
+            }
 
             if !display_pending
                 && (state.refresh_requested || now_ms.saturating_sub(last_display) >= DISPLAY_MS)
             {
                 state.refresh_requested = false;
-                render_dashboard(&mut framebuffer, &state).expect("framebuffer is infallible");
+                living::render(&mut framebuffer.landscape(), &living, &state, now_ms)
+                    .expect("framebuffer is infallible");
                 display_pending = true;
                 display_pending_since = now_ms;
                 unsafe {
@@ -375,24 +569,6 @@ mod firmware {
             };
             info!("board subsystem {name}: {detail}");
             state.record(0, "BOARD", format!("{name} {detail}"));
-        }
-    }
-
-    fn sample_button(
-        engine: &mut ButtonEngine,
-        state: &mut DashboardState,
-        button: Button,
-        pressed: bool,
-        now_ms: u64,
-    ) {
-        if let Some(event) = engine.sample(button, pressed, now_ms) {
-            info!(
-                "{} {:?} held={}ms",
-                button.label(),
-                event.gesture,
-                event.held_ms
-            );
-            state.apply_input(event, now_ms);
         }
     }
 
@@ -582,14 +758,13 @@ mod firmware {
 
     fn start_wifi<'d>(
         modem: esp_idf_hal::modem::Modem<'d>,
-    ) -> anyhow::Result<BlockingWifi<EspWifi<'d>>> {
+        nvs: EspDefaultNvsPartition,
+    ) -> anyhow::Result<EspWifi<'d>> {
         if WIFI_SSID.is_empty() || WIFI_PASSWORD.is_empty() {
             return Err(anyhow!("Wi-Fi credentials are empty"));
         }
         let sys_loop = EspSystemEventLoop::take()?;
-        let nvs = EspDefaultNvsPartition::take()?;
-        let mut wifi =
-            BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
+        let mut wifi = EspWifi::new(modem, sys_loop, Some(nvs))?;
         wifi.set_configuration(&Configuration::Client(ClientConfiguration {
             ssid: WIFI_SSID
                 .try_into()
@@ -601,24 +776,23 @@ mod firmware {
         }))?;
         wifi.start()?;
         wifi.connect()?;
-        wifi.wait_netif_up()?;
         Ok(wifi)
     }
 
     fn update_wifi(
-        wifi: &mut Option<BlockingWifi<EspWifi<'_>>>,
+        wifi: &mut Option<EspWifi<'_>>,
         state: &mut DashboardState,
         now_ms: u64,
         last_retry: &mut u64,
     ) {
         let Some(wifi) = wifi.as_mut() else { return };
-        if wifi.is_connected().unwrap_or(false) {
+        if wifi.is_up().unwrap_or(false) {
             let recovered = state.wifi.health != Health::Ok;
             state.wifi.health = Health::Ok;
-            if let Ok(info) = wifi.wifi().sta_netif().get_ip_info() {
+            if let Ok(info) = wifi.sta_netif().get_ip_info() {
                 state.wifi.ipv4 = info.ip.to_string();
             }
-            if let Ok(rssi) = wifi.wifi().get_rssi() {
+            if let Ok(rssi) = wifi.get_rssi() {
                 state.wifi.rssi_dbm = rssi.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             }
             if recovered {

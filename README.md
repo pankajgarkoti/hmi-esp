@@ -1,5 +1,47 @@
 # hmi-esp
 
+## Living Display — RLCD fork
+
+This fork turns the **Waveshare ESP32-S3-RLCD-4.2** into a landscape living display:
+16 selectable cellular automata, microphone-driven perturbations, SD-backed worlds,
+and a brief network-synchronized clock glance. It uses small local acoustic
+fingerprints for the sound of **"time"** and a transient detector for **finger snaps**;
+there is no speech-to-text engine, neural speech model, or cloud audio service.
+
+- **KEY click:** clock for five seconds (simulation continues); click again to return.
+- **BOOT click:** Settings / next row. **BOOT hold:** change selected value.
+- **KEY hold:** return to the living field. **PWR hold:** hardware power off.
+- Default: Conway, **4 generations/second**, subtle microphone perturbations.
+- Set **MICROPHONE → OFF** for exact, unperturbed rules; clock sound cues stay enabled.
+- **AUTO TOUR:** Off / 30 seconds / 2 minutes / 5 minutes per world.
+- **NEW SEED:** deliberately replace only the current world's grid.
+- **TEACH TIME:** hold, release, then say "time" once. Stores only a small acoustic
+  fingerprint. This is the best option for a different voice or room; similar sounds
+  can match, and the detector is not general speech recognition.
+
+Worlds resume when selected. With an SD card, snapshots are saved on switching and
+every 30 seconds (unchanged worlds are skipped). Abrupt power-off can lose the
+latest interval. Files live under `/sdcard/living/`, with checksums and a previous
+copy for recovery. Without SD, worlds survive switches but not a power cycle.
+
+Build and flash (requires the `esp` Rust toolchain, `ldproxy`, CMake, Ninja, Python and `uv`):
+
+```sh
+# .env.local: WIFI_SSID=... and WIFI_PASSWORD=... (no surrounding quotes)
+./scripts/vendor-sync.sh
+. ~/export-esp.sh
+./scripts/build-firmware.sh
+sh scripts/flash-rlcd.sh /dev/cu.usbmodem2101
+```
+
+The flash command is only for **RLCD-4.2**, not Touch349. Keep `.env.local`, generated
+firmware images (which contain Wi-Fi credentials), and device backups private.
+
+See [Living Display design, research and verification](docs/living-display.md).
+The original project documentation and other board targets follow below.
+
+---
+
 Reference and integration workspace for a Rust-first HMI on the exact
 Waveshare ESP32-S3-RLCD-4.2 and ESP32-S3-Touch-LCD-3.49 V2 platforms.
 

@@ -38,6 +38,11 @@ impl FrameBuffer {
         self.bytes.fill(0xff);
     }
 
+    /// Landscape with the physical buttons on the right-hand edge.
+    pub fn landscape(&mut self) -> Landscape<'_> {
+        Landscape(self)
+    }
+
     pub fn set_pixel(&mut self, point: Point, color: BinaryColor) {
         if point.x < 0 || point.y < 0 || point.x >= WIDTH as i32 || point.y >= HEIGHT as i32 {
             return;
@@ -51,6 +56,39 @@ impl FrameBuffer {
             BinaryColor::On => self.bytes[index] |= mask, // white panel background
             BinaryColor::Off => self.bytes[index] &= !mask, // black ink
         }
+    }
+}
+
+pub struct Landscape<'a>(&'a mut FrameBuffer);
+
+impl OriginDimensions for Landscape<'_> {
+    fn size(&self) -> Size {
+        Size::new(HEIGHT, WIDTH)
+    }
+}
+
+impl DrawTarget for Landscape<'_> {
+    type Color = BinaryColor;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(p, color) in pixels {
+            if p.x >= 0 && p.y >= 0 && p.x < HEIGHT as i32 && p.y < WIDTH as i32 {
+                self.0
+                    .set_pixel(Point::new(WIDTH as i32 - 1 - p.y, p.x), color);
+            }
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+        self.0
+            .bytes
+            .fill(if color == BinaryColor::On { 0xff } else { 0 });
+        Ok(())
     }
 }
 
@@ -169,6 +207,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn landscape_corners_map_to_native_panel_without_mirroring() {
+        for (logical, native) in [
+            (Point::new(0, 0), Point::new(299, 0)),
+            (Point::new(399, 0), Point::new(299, 399)),
+            (Point::new(0, 299), Point::new(0, 0)),
+            (Point::new(399, 299), Point::new(0, 399)),
+            (Point::new(123, 45), Point::new(254, 123)),
+        ] {
+            let mut actual = FrameBuffer::new();
+            let mut expected = FrameBuffer::new();
+            let mut landscape = actual.landscape();
+            assert_eq!(landscape.size(), Size::new(400, 300));
+            landscape
+                .draw_iter([Pixel(logical, BinaryColor::Off)])
+                .unwrap();
+            expected.set_pixel(native, BinaryColor::Off);
+            assert_eq!(actual.bytes(), expected.bytes());
+        }
+    }
+
+    #[test]
+    fn landscape_rejects_offscreen_pixels_and_clears_whole_panel() {
+        let mut frame = FrameBuffer::new();
+        let mut landscape = frame.landscape();
+        landscape
+            .draw_iter([
+                Pixel(Point::new(-1, 0), BinaryColor::Off),
+                Pixel(Point::new(400, 0), BinaryColor::Off),
+                Pixel(Point::new(0, 300), BinaryColor::Off),
+            ])
+            .unwrap();
+        assert!(frame.bytes().iter().all(|b| *b == 0xff));
+        frame.landscape().clear(BinaryColor::Off).unwrap();
+        assert!(frame.bytes().iter().all(|b| *b == 0));
+    }
 
     #[test]
     fn framebuffer_is_exact_panel_size_and_white_by_default() {

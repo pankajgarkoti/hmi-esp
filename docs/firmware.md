@@ -1,5 +1,10 @@
 # Local device firmware
 
+> **RLCD fork update:** the current RLCD application is the landscape Living Display.
+> See [living-display.md](living-display.md) for its controls, sound cues and persistence.
+> The portrait diagnostic/recorder interface described below is the upstream reference;
+> its reusable code remains in the workspace but is not the RLCD home interface.
+
 The primary firmware is a local diagnostic interface for the exact Waveshare
 ESP32-S3-RLCD-4.2. A separate bring-up firmware targets the
 ESP32-S3-Touch-LCD-3.49 V2; both consume the same Rust dashboard state while

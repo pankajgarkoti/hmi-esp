@@ -9,6 +9,11 @@ if [ ! -f .env.local ]; then
   exit 1
 fi
 
+export ESP_IDF_SYS_ROOT_CRATE=hmi-firmware
+export ESP_IDF_SDKCONFIG_DEFAULTS="$repo_root/crates/hmi-firmware/sdkconfig.defaults"
+# Native component changes are not tracked by Cargo. Rebuild their owner rather
+# than silently reusing stale C objects.
+cargo +esp clean -p esp-idf-sys --release --target xtensa-esp32s3-espidf
 exec cargo +esp build \
   -p hmi-firmware \
   --release \

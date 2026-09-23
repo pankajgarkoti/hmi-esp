@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/sdmmc_host.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -36,6 +37,7 @@ static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_adc_cali;
 static sdmmc_card_t *s_sdcard;
 static bool s_time_started;
+static bool s_usb_ready;
 static atomic_bool s_te_rising_edge;
 
 enum { AUDIO_CHUNK_SAMPLES = 512, AUDIO_QUEUE_DEPTH = 8 };
@@ -262,6 +264,9 @@ static bool init_sd(void)
 
 uint32_t hmi_board_init(void)
 {
+    // Local USB test/control interface. Never block rendering waiting for input.
+    usb_serial_jtag_driver_config_t usb = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    s_usb_ready = usb_serial_jtag_is_driver_installed() || usb_serial_jtag_driver_install(&usb) == ESP_OK;
     uint32_t ready = 0;
     bool audio = init_audio_and_i2c();
     if (audio) ready |= HMI_BOARD_AUDIO_READY;
@@ -269,6 +274,12 @@ uint32_t hmi_board_init(void)
     if (init_battery()) ready |= HMI_BOARD_BATTERY_READY;
     if (init_sd()) ready |= HMI_BOARD_SD_READY;
     return ready;
+}
+
+int hmi_board_poll_command(void)
+{
+    unsigned char command;
+    return s_usb_ready && usb_serial_jtag_read_bytes(&command, 1, 0) == 1 ? command : -1;
 }
 
 int hmi_board_env_read(int32_t *temperature_centi_c, uint32_t *humidity_centi_pct)

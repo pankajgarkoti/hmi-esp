@@ -869,6 +869,7 @@ name = "hmi-core"
 version = "0.1.0"
 dependencies = [
  "embedded-graphics",
+ "micromath",
 ]
 
 [[package]]

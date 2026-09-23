@@ -6,4 +6,4 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 embedded-graphics = { version = "0.8.1", default-features = false }
-
+micromath = "2.1.0"

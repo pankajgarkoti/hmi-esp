@@ -9,6 +9,11 @@ members = [
 ]
 exclude = ["vendor/upstream"]
 
+[profile.release]
+# Remove unused HAL drivers before native linking: the legacy I2C constructor
+# otherwise conflicts with the board's new ESP-IDF I2C master driver at boot.
+lto = true
+
 # Development-only source overrides. These make a future workspace use the
 # exact local checkouts recorded in vendor/sources.lock instead of silently
 # resolving a different crates.io release.

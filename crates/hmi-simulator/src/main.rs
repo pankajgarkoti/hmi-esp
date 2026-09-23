@@ -40,6 +40,39 @@ fn main() -> anyhow::Result<()> {
         .pixel_spacing(0)
         .build();
     match board.as_str() {
+        "living" => {
+            use hmi_core::living::{self, LivingDisplay, Rule, Settings};
+            let mut app = LivingDisplay::new(Settings::default(), 42);
+            app.voice_ready = true;
+            if requested_page == "brain" {
+                app.automaton.rule = Rule::Brain;
+                app.settings.rule = Rule::Brain;
+            }
+            if requested_page == "highlife" {
+                app.automaton.rule = Rule::HighLife;
+                app.settings.rule = Rule::HighLife;
+            }
+            for i in 1..=80 {
+                app.audio(&[123, -2345, 67]);
+                app.advance(i * 125);
+            }
+            if requested_page == "clock" {
+                app.show_clock(10000);
+            }
+            if requested_page == "settings" {
+                app.input(
+                    hmi_core::InputEvent {
+                        button: hmi_core::Button::Boot,
+                        gesture: hmi_core::Gesture::Click,
+                        held_ms: 50,
+                    },
+                    10000,
+                );
+            }
+            let mut display = SimulatorDisplay::<BinaryColor>::new(Size::new(400, 300));
+            living::render(&mut display, &app, &state, 10000).expect("infallible living display");
+            display.to_rgb_output_image(&settings).save_png(&output)?;
+        }
         "touch349-v2" => {
             let mut display = SimulatorDisplay::<Rgb565>::new(Size::new(172, 640));
             render_touch349_dashboard(&mut display, &state)

@@ -4,6 +4,8 @@ extern crate alloc;
 
 pub mod living;
 pub mod sounds;
+pub mod usb_commands;
+pub mod wifi_setup;
 
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
 use core::fmt::Write as _;

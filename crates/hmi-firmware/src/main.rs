@@ -11,6 +11,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "espidf")]
+mod wifi_portal;
+#[cfg(target_os = "espidf")]
 mod world_store;
 
 #[cfg(target_os = "espidf")]
@@ -31,9 +33,12 @@ mod firmware {
         vec::Vec,
     };
 
+    use crate::wifi_portal::Portal;
     use crate::world_store::WorldStore;
     use anyhow::{anyhow, Context};
-    use embedded_svc::wifi::{ClientConfiguration, Configuration};
+    use embedded_svc::wifi::{
+        AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration,
+    };
     use esp_idf_hal::{
         delay::Ets,
         gpio::{PinDriver, Pull},
@@ -49,6 +54,8 @@ mod firmware {
     };
     use hmi_core::living::{self, LivingDisplay, Rule, Settings};
     use hmi_core::sounds::{Cue, SoundDetector};
+    use hmi_core::usb_commands::{Command, UsbCommands};
+    use hmi_core::wifi_setup::Credentials;
     use hmi_core::{
         BatteryTelemetry, Button, ButtonEngine, ClockTelemetry, DashboardState,
         EnvironmentTelemetry, FileEntry, FileKind, Health, UiAction, View,
@@ -108,6 +115,22 @@ mod firmware {
         let pins = peripherals.pins;
         let nvs = EspDefaultNvsPartition::take()?;
         let preferences = EspNvs::new(nvs.clone(), "living", true).ok();
+        let wifi_preferences = EspNvs::new(nvs.clone(), "wifi_setup", true).ok();
+        let fallback_wifi = Credentials {
+            ssid: WIFI_SSID.into(),
+            password: WIFI_PASSWORD.into(),
+        };
+        let mut current_wifi = wifi_preferences
+            .as_ref()
+            .and_then(|prefs| {
+                let mut blob = [0u8; 100];
+                prefs
+                    .get_blob("network", &mut blob)
+                    .ok()
+                    .flatten()
+                    .and_then(Credentials::decode)
+            })
+            .unwrap_or(fallback_wifi);
         let settings = preferences
             .as_ref()
             .and_then(|p| p.get_u32("settings").ok().flatten())
@@ -210,10 +233,10 @@ mod firmware {
             sample_environment(&mut state, 0);
         }
 
-        let mut wifi = match start_wifi(peripherals.modem, nvs) {
+        let mut wifi = match start_wifi(peripherals.modem, nvs, &current_wifi) {
             Ok(wifi) => {
                 state.wifi.health = Health::Stale;
-                state.wifi.ssid = WIFI_SSID.into();
+                state.wifi.ssid = current_wifi.ssid.clone();
                 state.record(0, "WIFI", "station started; waiting for DHCP");
                 Some(wifi)
             }
@@ -263,6 +286,11 @@ mod firmware {
         let mut last_checkpoint = 0;
         let mut previous_rule = living.settings.rule;
         let mut previous_surface = living.surface(0);
+        let mut usb_commands = UsbCommands::default();
+        let mut portal: Option<Portal> = None;
+        let mut submitted_wifi: Option<(Credentials, u64)> = None;
+        let mut pending_wifi: Option<(Credentials, u64)> = None;
+        let mut wifi_join_retry_at = 0u64;
 
         loop {
             let loop_started = Instant::now();
@@ -270,12 +298,21 @@ mod firmware {
             state.runtime.uptime_ms = now_ms;
             state.environment.sample_age_ms = now_ms.saturating_sub(last_env_success);
 
-            let command = unsafe { hmi_board_poll_command() };
+            let mut command = None;
+            for _ in 0..128 {
+                let byte = unsafe { hmi_board_poll_command() };
+                if byte < 0 {
+                    break;
+                }
+                if let Some(parsed) = usb_commands.feed(byte as u8) {
+                    command = Some(parsed);
+                }
+            }
             let debug_event = match command {
-                98 => Some((Button::Boot, hmi_core::Gesture::Click)),
-                66 => Some((Button::Boot, hmi_core::Gesture::LongPress)),
-                107 => Some((Button::Key, hmi_core::Gesture::Click)),
-                75 => Some((Button::Key, hmi_core::Gesture::LongPress)),
+                Some(Command::BootClick) => Some((Button::Boot, hmi_core::Gesture::Click)),
+                Some(Command::BootHold) => Some((Button::Boot, hmi_core::Gesture::LongPress)),
+                Some(Command::KeyClick) => Some((Button::Key, hmi_core::Gesture::Click)),
+                Some(Command::KeyHold) => Some((Button::Key, hmi_core::Gesture::LongPress)),
                 _ => None,
             }
             .map(|(button, gesture)| hmi_core::InputEvent {
@@ -283,12 +320,12 @@ mod firmware {
                 gesture,
                 held_ms: 700,
             });
-            if command == 116 {
+            if command == Some(Command::Clock) {
                 living.show_clock(now_ms);
             }
-            if command == 115 {
-                info!("STATUS rule={:?} gen={} surface={:?} mic={} sound_distance={} segments={} frames={} saved={}",living.settings.rule,
-                    living.automaton.generation,living.surface(now_ms),living.mic_peak,sounds.last_distance,sounds.segments,sounds.last_frames,living.sd_status);
+            if command == Some(Command::Status) {
+                info!("STATUS rule={:?} gen={} surface={:?} battery={}% mv={} mic={} sound_distance={} segments={} frames={} saved={}",living.settings.rule,
+                    living.automaton.generation,living.surface(now_ms),state.battery.percent,state.battery.millivolts,living.mic_peak,sounds.last_distance,sounds.segments,sounds.last_frames,living.sd_status);
             }
             let events = [
                 buttons.sample(Button::Boot, boot_button.is_low(), now_ms),
@@ -319,6 +356,155 @@ mod firmware {
                 sounds.learn_next();
                 living.sound_message = "LISTENING: SAY TIME ONCE";
                 info!("sound learning started: say time once");
+            }
+            if living.wifi_setup_requested {
+                living.wifi_setup_requested = false;
+                if wifi_preferences.is_none() {
+                    living.wifi_message = "SETUP STORAGE UNAVAILABLE";
+                } else if let Some(station) = wifi.as_mut() {
+                    let code = format!(
+                        "{:06X}{:06X}",
+                        unsafe { esp_idf_sys::esp_random() } & 0xffffff,
+                        unsafe { esp_idf_sys::esp_random() } & 0xffffff
+                    );
+                    let name = "Living-RLCD";
+                    let ap = AccessPointConfiguration {
+                        ssid: name.try_into()?,
+                        password: code.as_str().try_into()?,
+                        auth_method: AuthMethod::WPA2Personal,
+                        max_connections: 2,
+                        ..Default::default()
+                    };
+                    let result = (|| -> anyhow::Result<Portal> {
+                        station.stop()?;
+                        station.set_configuration(&Configuration::AccessPoint(ap))?;
+                        station.start()?;
+                        Ok(Portal::start()?)
+                    })();
+                    match result {
+                        Ok(server) => {
+                            portal = Some(server);
+                            let address = station
+                                .ap_netif()
+                                .get_ip_info()
+                                .map(|info| info.ip.to_string())
+                                .unwrap_or_else(|err| {
+                                    warn!("setup AP address lookup failed: {err}");
+                                    "192.168.71.1".into()
+                                });
+                            living.begin_wifi_setup(now_ms, name, &code, &address);
+                            info!("Wi-Fi setup started for 180 seconds");
+                        }
+                        Err(err) => {
+                            warn!("Wi-Fi setup start failed: {err:#}");
+                            living.wifi_message = "SETUP FAILED / TRY AGAIN";
+                            restore_wifi(station, &current_wifi);
+                        }
+                    }
+                } else {
+                    living.wifi_message = "RADIO UNAVAILABLE";
+                }
+                state.refresh_requested = true;
+            }
+            if let Some(server) = portal.as_ref() {
+                if submitted_wifi.is_none() {
+                    if let Some(credentials) = server.receive() {
+                        // Let HTTP finish replying to the phone before turning the AP off.
+                        submitted_wifi = Some((credentials, now_ms + 800));
+                        living.wifi_message = "RECEIVED / CONNECTING SOON";
+                    }
+                }
+            }
+            if living.wifi_setup_active
+                && submitted_wifi.as_ref().is_some_and(|(_, at)| now_ms >= *at)
+            {
+                if let Some((credentials, _)) = submitted_wifi.take() {
+                    portal.take();
+                    living.wifi_message = "CONNECTING TO NEW WI-FI";
+                    living.wifi_password.clear();
+                    if let Some(station) = wifi.as_mut() {
+                        let attempt = (|| -> anyhow::Result<()> {
+                            station.stop()?;
+                            station.set_configuration(&Configuration::Client(client_config(
+                                &credentials,
+                            )?))?;
+                            station.start()?;
+                            station.connect()?;
+                            Ok(())
+                        })();
+                        match attempt {
+                            Ok(()) => {
+                                pending_wifi = Some((credentials, now_ms + 25_000));
+                                wifi_join_retry_at = now_ms + 8_000;
+                            }
+                            Err(err) => {
+                                warn!("network setup connection error: {err:#}");
+                                restore_wifi(station, &current_wifi);
+                                living.end_wifi_setup(now_ms);
+                                living.wifi_message = "JOIN FAILED / TRY AGAIN";
+                            }
+                        }
+                    }
+                    state.refresh_requested = true;
+                }
+            }
+            if portal.is_some() && (living.wifi_setup_expired(now_ms) || !living.wifi_setup_active)
+            {
+                portal.take();
+                submitted_wifi = None;
+                if let Some(station) = wifi.as_mut() {
+                    restore_wifi(station, &current_wifi);
+                }
+                living.end_wifi_setup(now_ms);
+                living.wifi_message = "SETUP ENDED / TRY AGAIN";
+                state.refresh_requested = true;
+            }
+            if pending_wifi.is_some() && !living.wifi_setup_active {
+                pending_wifi = None;
+                if let Some(station) = wifi.as_mut() {
+                    restore_wifi(station, &current_wifi);
+                }
+                living.wifi_message = "SETUP CANCELLED";
+            }
+            if let Some((credentials, deadline)) = pending_wifi.take() {
+                let connected = wifi
+                    .as_ref()
+                    .map(|station| station.is_up().unwrap_or(false))
+                    .unwrap_or(false);
+                if connected {
+                    if let Some(prefs) = wifi_preferences.as_ref() {
+                        match prefs.set_blob("network", &credentials.encode()) {
+                            Ok(()) => {
+                                current_wifi = credentials;
+                                state.wifi.ssid = current_wifi.ssid.clone();
+                                living.wifi_message = "CONNECTED / NETWORK SAVED";
+                                info!("Wi-Fi setup connected and saved");
+                            }
+                            Err(err) => {
+                                warn!("Wi-Fi setup NVS save failed: {err}");
+                                living.wifi_message = "CONNECTED / SAVE FAILED";
+                            }
+                        }
+                    }
+                    living.end_wifi_setup(now_ms);
+                } else if now_ms >= deadline {
+                    if let Some(station) = wifi.as_mut() {
+                        restore_wifi(station, &current_wifi);
+                    }
+                    living.end_wifi_setup(now_ms);
+                    living.wifi_message = "NO CONNECTION / TRY AGAIN";
+                } else {
+                    if now_ms >= wifi_join_retry_at {
+                        if let Some(station) = wifi.as_mut() {
+                            let _ = station.disconnect();
+                            if let Err(err) = station.connect() {
+                                warn!("new Wi-Fi retry: {err}");
+                            }
+                        }
+                        wifi_join_retry_at = now_ms + 8_000;
+                    }
+                    pending_wifi = Some((credentials, deadline));
+                }
             }
             for button in Button::ALL {
                 let stats = &mut state.buttons[button.index()];
@@ -435,7 +621,9 @@ mod firmware {
                 last_storage = now_ms;
                 sample_storage(&mut state, now_ms);
             }
-            update_wifi(&mut wifi, &mut state, now_ms, &mut last_wifi_retry);
+            if !living.wifi_setup_active {
+                update_wifi(&mut wifi, &mut state, now_ms, &mut last_wifi_retry);
+            }
             update_runtime(&mut state);
             if now_ms.saturating_sub(last_runtime_event) >= RUNTIME_EVENT_MS {
                 last_runtime_event = now_ms;
@@ -756,26 +944,56 @@ mod firmware {
         }
     }
 
+    fn client_config(credentials: &Credentials) -> anyhow::Result<ClientConfiguration> {
+        let credentials = credentials
+            .clone()
+            .validate()
+            .ok_or_else(|| anyhow!("invalid Wi-Fi configuration"))?;
+        Ok(ClientConfiguration {
+            ssid: credentials
+                .ssid
+                .as_str()
+                .try_into()
+                .map_err(|_| anyhow!("SSID is too long"))?,
+            password: credentials
+                .password
+                .as_str()
+                .try_into()
+                .map_err(|_| anyhow!("password is too long"))?,
+            auth_method: if credentials.password.is_empty() {
+                AuthMethod::None
+            } else {
+                AuthMethod::WPA2Personal
+            },
+            ..Default::default()
+        })
+    }
+
+    fn restore_wifi(station: &mut EspWifi<'_>, credentials: &Credentials) {
+        let result = (|| -> anyhow::Result<()> {
+            station.stop()?;
+            station.set_configuration(&Configuration::Client(client_config(credentials)?))?;
+            station.start()?;
+            station.connect()?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            warn!("returning to previous Wi-Fi failed: {err:#}");
+        }
+    }
+
     fn start_wifi<'d>(
         modem: esp_idf_hal::modem::Modem<'d>,
         nvs: EspDefaultNvsPartition,
+        credentials: &Credentials,
     ) -> anyhow::Result<EspWifi<'d>> {
-        if WIFI_SSID.is_empty() || WIFI_PASSWORD.is_empty() {
-            return Err(anyhow!("Wi-Fi credentials are empty"));
-        }
         let sys_loop = EspSystemEventLoop::take()?;
         let mut wifi = EspWifi::new(modem, sys_loop, Some(nvs))?;
-        wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-            ssid: WIFI_SSID
-                .try_into()
-                .map_err(|_| anyhow!("SSID is too long"))?,
-            password: WIFI_PASSWORD
-                .try_into()
-                .map_err(|_| anyhow!("Wi-Fi password is too long"))?,
-            ..Default::default()
-        }))?;
+        wifi.set_configuration(&Configuration::Client(client_config(credentials)?))?;
         wifi.start()?;
-        wifi.connect()?;
+        if let Err(err) = wifi.connect() {
+            warn!("initial Wi-Fi connection deferred: {err}");
+        }
         Ok(wifi)
     }
 
@@ -806,6 +1024,7 @@ mod firmware {
             if now_ms.saturating_sub(*last_retry) >= WIFI_RETRY_MS {
                 *last_retry = now_ms;
                 state.wifi.reconnects = state.wifi.reconnects.saturating_add(1);
+                let _ = wifi.disconnect();
                 if let Err(err) = wifi.connect() {
                     warn!("Wi-Fi reconnect failed: {err}");
                 }

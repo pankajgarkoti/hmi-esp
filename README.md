@@ -18,6 +18,14 @@ there is no speech-to-text engine, neural speech model, or cloud audio service.
 - **TEACH TIME:** hold, release, then say "time" once. Stores only a small acoustic
   fingerprint. This is the best option for a different voice or room; similar sounds
   can match, and the detector is not general speech recognition.
+- **WI-FI SETUP:** select it in Settings and hold BOOT. Join the temporary
+  `Living-RLCD` network on your phone using the password shown on the display,
+  accept "stay connected without internet" if prompted, then open the address
+  shown there and enter the destination **2.4 GHz** network.
+  This setup window closes after three minutes or when you press KEY. New
+  credentials are stored on the board only after the connection succeeds.
+- Battery percentage appears on both the living field and the clock; it is an
+  approximate voltage-derived reading, not a fuel-gauge measurement.
 
 Worlds resume when selected. With an SD card, snapshots are saved on switching and
 every 30 seconds (unchanged worlds are skipped). Abrupt power-off can lose the

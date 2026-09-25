@@ -29,9 +29,11 @@ start = time.monotonic()
 spoken = False
 while time.monotonic() - start < args.seconds:
     elapsed = time.monotonic() - start
+    wire = {'t': b'CLOCK', 's': b'STATUS', 'b': b'BOOT', 'B': b'BOOT_HOLD',
+            'k': b'KEY', 'K': b'KEY_HOLD'}
     while commands and elapsed >= commands[0][0]:
         _, command = commands.pop(0)
-        port.write(command)
+        port.write(b'@LIVING\t' + wire[command.decode()] + b'\n')
     if args.say and not spoken and elapsed >= 4:
         print(f"ACOUSTIC TEST: {args.say}", flush=True)
         command = ["say", "-v", "Samantha"]

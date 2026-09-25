@@ -229,6 +229,38 @@ fn tour_returns_to_saved_world_without_resetting() {
 }
 
 #[test]
+fn wifi_setup_is_only_requested_from_settings_and_simulation_keeps_stepping() {
+    let mut app = LivingDisplay::new(Settings::default(), 17);
+    for now in (100..=150).step_by(10) {
+        app.advance(now);
+    }
+    app.input(event(Button::Boot, Gesture::Click), 150);
+    for index in 0..7 {
+        app.input(event(Button::Boot, Gesture::Click), 160 + index * 10);
+    }
+    assert_eq!(app.selected, 7);
+    app.input(event(Button::Boot, Gesture::LongPress), 240);
+    assert!(app.wifi_setup_requested);
+    app.begin_wifi_setup(240, "Living-265C", "ABCDEFGH2345", "192.168.71.1");
+    assert_eq!(app.surface(250), Surface::WifiSetup);
+    assert!(!app.voice_time(250));
+    app.advance(1500);
+    assert!(app.automaton.generation > 0);
+    app.input(event(Button::Key, Gesture::Click), 1500);
+    assert_ne!(app.surface(1500), Surface::WifiSetup);
+}
+
+#[test]
+fn battery_label_shows_real_percentage_or_unavailable() {
+    use hmi_core::{BatteryTelemetry, Health};
+    let mut battery = BatteryTelemetry::default();
+    assert_eq!(hmi_core::living::battery_label(&battery), "BAT --%");
+    battery.health = Health::Ok;
+    battery.percent = 87;
+    assert_eq!(hmi_core::living::battery_label(&battery), "BAT 87%");
+}
+
+#[test]
 fn voice_retrigger_cannot_pin_the_clock_forever() {
     let mut app = LivingDisplay::new(Settings::default(), 5);
     assert!(app.voice_time(1000));
@@ -236,4 +268,17 @@ fn voice_retrigger_cannot_pin_the_clock_forever() {
     assert_eq!(app.surface(6000), Surface::Life);
     assert!(!app.voice_time(6500));
     assert!(app.voice_time(8000));
+}
+
+#[test]
+fn a_sound_cue_cannot_interrupt_settings_navigation() {
+    let mut app = LivingDisplay::new(Settings::default(), 13);
+    app.input(event(Button::Boot, Gesture::Click), 100);
+    assert_eq!(app.surface(200), Surface::Settings);
+    assert!(!app.voice_time(200));
+    assert_eq!(app.surface(200), Surface::Settings);
+    for step in 0..7 {
+        app.input(event(Button::Boot, Gesture::Click), 210 + step * 10);
+    }
+    assert_eq!(app.selected, 7);
 }

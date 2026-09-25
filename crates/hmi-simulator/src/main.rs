@@ -69,6 +69,9 @@ fn main() -> anyhow::Result<()> {
                     10000,
                 );
             }
+            if requested_page == "wifi" {
+                app.begin_wifi_setup(10000, "Living-RLCD", "EXAMPLEPASS12", "192.168.71.1");
+            }
             let mut display = SimulatorDisplay::<BinaryColor>::new(Size::new(400, 300));
             living::render(&mut display, &app, &state, 10000).expect("infallible living display");
             display.to_rgb_output_image(&settings).save_png(&output)?;

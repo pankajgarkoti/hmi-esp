@@ -20,6 +20,35 @@ result rather than indefinite feature expansion.
 | BOOT hold | Change selected setting |
 | PWR hold | Hardware power off |
 | Finger snap / matching "time" sound | Temporary clock; animation keeps evolving |
+| Settings > WI-FI SETUP > BOOT hold | Temporary WPA2 setup network with instructions on screen |
+
+The board now ignores unrelated USB traffic. Diagnostic commands must be a whole
+line such as `@LIVING\tSTATUS\n`; unframed serial bytes from other programs cannot
+open Settings or the clock. A separate incompatible AgentDeck USB companion may
+still reset the USB peripheral on reconnect if it is started against this board;
+leave that companion in simulator mode or stopped when using Living Display.
+
+The board samples the battery ADC periodically and shows an **approximate voltage
+percentage** at the top-right of the home field and clock. It is not a calibrated
+battery fuel gauge.
+
+### On-device Wi-Fi setup
+
+1. Click BOOT from the field to open Settings. Click BOOT seven more times to
+   select **WI-FI SETUP**; hold BOOT to start it.
+2. With a phone, join `Living-RLCD` using the 12-character temporary password
+   shown on the board. If the phone warns the network has no internet, choose to
+   stay connected. Open the **HTTP address shown on the board** in the browser
+   (typically `http://192.168.71.1`; the actual AP address is read at runtime).
+3. Enter the desired 2.4 GHz Wi-Fi SSID and password. The temporary AP closes
+   after submission; the board tries the new network and saves its credentials
+   in NVS only after obtaining an address. If it fails, the previous network is
+   restored. Hold/select the setup row again to retry.
+
+The temporary WPA2 AP is enabled only on explicit physical setup and ends after
+three minutes or a KEY press. The HTTP form is served only in AP mode and uses no
+internet or remote service. Do not enter credentials from an untrusted phone.
+Previously saved automata and settings are not deleted by reconfiguration.
 
 Default speed is **4 generations/second**. Options are 2, 4, 8 and 16.
 Clock duration options are 3, 5 and 8 seconds. Repeated cues cannot pin the clock
@@ -108,7 +137,7 @@ cargo +esp run -p hmi-simulator -- --board living --page settings --output artif
 
 USB-only local controls allow repeatable physical-board checks: `t` clock, `b` BOOT
 click, `B` BOOT hold, `k` KEY click, `K` KEY hold, `s` status. They route through the
-same application state logic; they do not prove physical button presses or sound
+same application state logic via explicitly framed `@LIVING` lines; they do not prove physical button presses or sound
 recognition. `scripts/observe-device.py --say time` plays through the Mac speaker
 and tests the real microphone path if the board can hear that output.
 

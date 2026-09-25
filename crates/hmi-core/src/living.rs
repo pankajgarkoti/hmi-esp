@@ -1,6 +1,6 @@
 //! Deterministic simulation and presentation; independent of audio, storage and clocks.
-use crate::{Button, DashboardState, Gesture, Health, InputEvent};
-use alloc::{format, vec, vec::Vec};
+use crate::{BatteryTelemetry, Button, DashboardState, Gesture, Health, InputEvent};
+use alloc::{format, string::String, vec, vec::Vec};
 use embedded_graphics::{
     mono_font::{
         ascii::{FONT_6X10, FONT_9X15_BOLD},
@@ -391,6 +391,7 @@ pub enum Surface {
     Life,
     Clock,
     Settings,
+    WifiSetup,
 }
 
 pub struct LivingDisplay {
@@ -402,6 +403,13 @@ pub struct LivingDisplay {
     pub learn_requested: bool,
     pub sound_message: &'static str,
     pub sd_status: &'static str,
+    pub wifi_setup_requested: bool,
+    pub wifi_setup_active: bool,
+    pub wifi_name: String,
+    pub wifi_password: String,
+    pub wifi_address: String,
+    pub wifi_message: &'static str,
+    wifi_setup_until: u64,
     parked: Vec<Option<Automaton>>,
     last_tour: u64,
     last_step: u64,
@@ -425,6 +433,13 @@ impl LivingDisplay {
             learn_requested: false,
             sound_message: "SNAP / SAY TIME",
             sd_status: "RAM ONLY",
+            wifi_setup_requested: false,
+            wifi_setup_active: false,
+            wifi_name: String::new(),
+            wifi_password: String::new(),
+            wifi_address: String::new(),
+            wifi_message: "WAITING FOR PHONE",
+            wifi_setup_until: 0,
             parked: (0..16).map(|_| None).collect(),
             last_tour: 0,
             last_step: 0,
@@ -472,7 +487,9 @@ impl LivingDisplay {
         }
     }
     pub fn surface(&self, now: u64) -> Surface {
-        if now < self.clock_until {
+        if self.wifi_setup_active && now < self.wifi_setup_until {
+            Surface::WifiSetup
+        } else if now < self.clock_until {
             Surface::Clock
         } else if now < self.settings_until {
             Surface::Settings
@@ -485,16 +502,44 @@ impl LivingDisplay {
         self.clock_until = now.saturating_add(self.settings.clock_ms());
     }
     pub fn voice_time(&mut self, now: u64) -> bool {
-        if now < self.voice_after {
+        if self.wifi_setup_active
+            || self.surface(now) == Surface::Settings
+            || now < self.voice_after
+        {
             return false;
         }
         self.show_clock(now);
         self.voice_after = self.clock_until.saturating_add(1500);
         true
     }
+    pub fn begin_wifi_setup(&mut self, now: u64, ssid: &str, password: &str, address: &str) {
+        self.wifi_setup_requested = false;
+        self.wifi_setup_active = true;
+        self.wifi_setup_until = now.saturating_add(180_000);
+        self.clock_until = 0;
+        self.wifi_name = ssid.into();
+        self.wifi_password = password.into();
+        self.wifi_address = address.into();
+        self.wifi_message = "JOIN NETWORK, OPEN PAGE";
+    }
+    pub fn end_wifi_setup(&mut self, now: u64) {
+        self.wifi_setup_active = false;
+        self.wifi_setup_requested = false;
+        self.wifi_password.clear();
+        self.settings_until = now.saturating_add(20_000);
+    }
+    pub fn wifi_setup_expired(&self, now: u64) -> bool {
+        self.wifi_setup_active && now >= self.wifi_setup_until
+    }
     /// Returns true only when a persistent setting changed.
     pub fn input(&mut self, event: InputEvent, now: u64) -> bool {
         let before = self.settings;
+        if self.wifi_setup_active {
+            if event.button == Button::Key {
+                self.end_wifi_setup(now);
+            }
+            return false;
+        }
         match (event.button, event.gesture) {
             (Button::Key, Gesture::LongPress) => {
                 self.clock_until = 0;
@@ -515,7 +560,7 @@ impl LivingDisplay {
                 if !was_settings {
                     self.selected = 0;
                 } else if gesture == Gesture::Click {
-                    self.selected = (self.selected + 1) % 7;
+                    self.selected = (self.selected + 1) % 8;
                 } else {
                     match self.selected {
                         0 => {
@@ -529,10 +574,11 @@ impl LivingDisplay {
                             self.last_tour = now;
                         }
                         5 => self.automaton.reseed(),
-                        _ => {
+                        6 => {
                             self.learn_requested = true;
                             self.settings_until = now.saturating_add(20000);
                         }
+                        _ => self.wifi_setup_requested = true,
                     }
                 }
             }
@@ -602,6 +648,14 @@ fn rule_line<D: DrawTarget<Color = BinaryColor>>(d: &mut D, y: i32) -> Result<()
         .draw(d)
 }
 
+pub fn battery_label(battery: &BatteryTelemetry) -> String {
+    if battery.health == Health::Ok {
+        format!("BAT {}%", battery.percent)
+    } else {
+        "BAT --%".into()
+    }
+}
+
 pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
     d: &mut D,
     app: &LivingDisplay,
@@ -613,17 +667,7 @@ pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
         Surface::Life => {
             text(d, "LIVING", 12, 8, false)?;
             text(d, app.settings.rule.name(), 72, 8, false)?;
-            text(
-                d,
-                if app.voice_ready {
-                    "SNAP / TIME"
-                } else {
-                    "KEY: TIME"
-                },
-                322,
-                8,
-                false,
-            )?;
+            text(d, &battery_label(&state.battery), 330, 8, false)?;
             for y in 0..GRID_HEIGHT {
                 for x in 0..GRID_WIDTH {
                     match app.automaton.cell(x, y) {
@@ -664,7 +708,8 @@ pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
         }
         Surface::Clock => {
             text(d, "A MOMENT IN TIME", 12, 12, false)?;
-            text(d, state.clock.zone, 366, 12, false)?;
+            text(d, state.clock.zone, 269, 12, false)?;
+            text(d, &battery_label(&state.battery), 330, 12, false)?;
             rule_line(d, 34)?;
             if state.clock.health == Health::Ok {
                 crate::draw_large_clock(d, 76, 65, state.clock.hour, state.clock.minute)?;
@@ -729,6 +774,7 @@ pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
                 ["OFF", "30 SECONDS", "2 MINUTES", "5 MINUTES"][app.settings.tour as usize].into(),
                 "HOLD TO RESEED".into(),
                 "HOLD THEN SAY TIME".into(),
+                "HOLD TO SET UP".into(),
             ];
             for (i, label) in [
                 "AUTOMATON",
@@ -738,11 +784,12 @@ pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
                 "AUTO TOUR",
                 "NEW SEED",
                 "TEACH TIME",
+                "WI-FI SETUP",
             ]
             .iter()
             .enumerate()
             {
-                let y = 53 + i as i32 * 28;
+                let y = 52 + i as i32 * 25;
                 if i == app.selected {
                     Rectangle::new(Point::new(10, y - 4), Size::new(380, 25))
                         .into_styled(PrimitiveStyle::with_stroke(INK, 1))
@@ -759,6 +806,8 @@ pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
                 d,
                 if app.selected == 0 {
                     app.settings.rule.description()
+                } else if app.selected == 7 {
+                    app.wifi_message
                 } else {
                     app.sound_message
                 },
@@ -773,6 +822,21 @@ pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
                 284,
                 false,
             )?;
+        }
+        Surface::WifiSetup => {
+            text(d, "WI-FI SETUP", 16, 12, true)?;
+            text(d, "KEY TO CANCEL", 292, 17, false)?;
+            rule_line(d, 39)?;
+            text(d, "1   ON YOUR PHONE, JOIN", 22, 56, false)?;
+            text(d, &app.wifi_name, 33, 74, true)?;
+            text(d, "NETWORK PASSWORD", 33, 102, false)?;
+            text(d, &app.wifi_password, 33, 119, true)?;
+            rule_line(d, 153)?;
+            text(d, "2   OPEN THIS PAGE IN A BROWSER", 22, 170, false)?;
+            text(d, &format!("http://{}", app.wifi_address), 33, 190, true)?;
+            text(d, "3   ENTER YOUR 2.4 GHz WI-FI DETAILS", 22, 225, false)?;
+            rule_line(d, 255)?;
+            text(d, app.wifi_message, 22, 267, false)?;
         }
     }
     Ok(())

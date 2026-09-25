@@ -879,6 +879,7 @@ dependencies = [
  "anyhow",
  "embedded-graphics",
  "embedded-hal 1.0.0",
+ "embedded-io 0.7.1",
  "embedded-svc",
  "embuild",
  "esp-idf-hal",

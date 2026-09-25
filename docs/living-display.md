@@ -10,6 +10,17 @@ glances. User-authorized scope includes implementation, physical-board flashing,
 and publishing source to the fork. The user requested a bounded, interesting
 result rather than indefinite feature expansion.
 
+The simulation grid is **200 × 124 cells** inside the 400 × 300 landscape
+interface, with two display pixels per cell. This has four times the cells
+of the original 100 × 62 grid. On first boot after upgrading, checksummed old
+worlds are centered in the larger grid; their cells and generation counters
+are kept, and the outer area gets a sparse, deterministic starting pattern.
+The first new SD save keeps the preceding snapshot both as a recovery copy
+and as a permanent `old-XX.bin` file for a possible rollback. Later
+saves rotate only the normal `.bin`/`.bak` pair. If both current snapshots are
+corrupt, startup falls back to that older archive. Existing Wi-Fi profiles and
+device settings are unaffected by the grid migration.
+
 ## Controls and defaults
 
 | Action | Result |
@@ -177,3 +188,10 @@ No credentials or credential-bearing firmware images are published.
   approximate and voice/room dependent.
 - Original firmware backup remains local and ignored. No firmware binaries are
   published because they embed local Wi-Fi credentials.
+- Larger-grid RLCD hardware check: all sixteen 100 × 62 saved worlds were read,
+  expanded to 200 × 124 and saved on the FAT SD card, with no write errors after
+  using 8.3-compatible migration archive filenames. A reboot restored the
+  increased Conway generation from the new snapshot; a subsequent 30-second
+  checkpoint saved all sixteen worlds. The main loop stayed around 91–94 Hz
+  and the panel flush took about 4 ms. The stored generation pace setting was
+  preserved. Network time and the preferred Wi-Fi network remained available.

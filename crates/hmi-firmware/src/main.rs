@@ -340,8 +340,8 @@ mod firmware {
                 living.show_clock(now_ms);
             }
             if command == Some(Command::Status) {
-                info!("STATUS rule={:?} gen={} surface={:?} battery={}% mv={} mic={} sound_distance={} segments={} frames={} saved={}",living.settings.rule,
-                    living.automaton.generation,living.surface(now_ms),state.battery.percent,state.battery.millivolts,living.mic_peak,sounds.last_distance,sounds.segments,sounds.last_frames,living.sd_status);
+                info!("STATUS rule={:?} gen={} surface={:?} battery={}% mv={} loop={}Hz lcd={}ms mic={} sound_distance={} segments={} frames={} saved={}",living.settings.rule,
+                    living.automaton.generation,living.surface(now_ms),state.battery.percent,state.battery.millivolts,state.runtime.loop_hz,state.runtime.display_flush_ms,living.mic_peak,sounds.last_distance,sounds.segments,sounds.last_frames,living.sd_status);
             }
             let events = [
                 buttons.sample(Button::Boot, boot_button.is_low(), now_ms),

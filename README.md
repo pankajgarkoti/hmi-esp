@@ -8,6 +8,10 @@ and a brief network-synchronized clock glance. It uses small local acoustic
 fingerprints for the sound of **"time"** and a transient detector for **finger snaps**;
 there is no speech-to-text engine, neural speech model, or cloud audio service.
 
+The living field has **200 × 124 cells** (2 × 2 display pixels per cell),
+four times the earlier cell count. Existing smaller SD worlds are expanded
+automatically, retaining their patterns and generation numbers.
+
 - **KEY click:** clock for five seconds (simulation continues); click again to return.
 - **BOOT click:** Settings / next row. **BOOT hold:** change selected value.
 - **KEY hold:** return to the living field. **PWR hold:** hardware power off.

@@ -1,4 +1,6 @@
-use hmi_core::living::{Automaton, LivingDisplay, Rule, Settings, Surface};
+use hmi_core::living::{
+    Automaton, LivingDisplay, Rule, Settings, Surface, GRID_HEIGHT, GRID_WIDTH,
+};
 use hmi_core::{Button, Gesture, InputEvent};
 
 fn event(button: Button, gesture: Gesture) -> InputEvent {
@@ -281,4 +283,104 @@ fn a_sound_cue_cannot_interrupt_settings_navigation() {
         app.input(event(Button::Boot, Gesture::Click), 210 + step * 10);
     }
     assert_eq!(app.selected, 7);
+}
+
+#[test]
+fn expands_legacy_worlds_without_losing_their_cells_or_generation() {
+    assert_eq!((GRID_WIDTH, GRID_HEIGHT), (200, 124));
+    for rule in Rule::ALL {
+        let mut legacy = Automaton::empty(100, 62, rule, 17);
+        legacy.generation = 4_321;
+        legacy.set(0, 0, 1);
+        legacy.set(99, 61, if rule == Rule::Brain { 2 } else { 1 });
+        legacy.set(47, 27, 1);
+        let saved = legacy.snapshot();
+        let mut app = LivingDisplay::new(
+            Settings {
+                rule,
+                microphone: 0,
+                ..Settings::default()
+            },
+            99,
+        );
+        assert!(
+            app.restore_world(Automaton::restore(&saved).unwrap()),
+            "{}",
+            rule.name()
+        );
+        assert_eq!(app.automaton.dimensions(), (200, 124));
+        assert_eq!(app.automaton.generation, 4_321);
+        assert_eq!(app.automaton.cell(50, 31), 1);
+        assert_eq!(
+            app.automaton.cell(149, 92),
+            if rule == Rule::Brain { 2 } else { 1 }
+        );
+        assert_eq!(app.automaton.cell(97, 58), 1);
+        assert!(
+            app.automaton.population() > legacy.population(),
+            "the newly available area should be alive too"
+        );
+        let migrated = app.automaton.snapshot();
+        assert_eq!(Automaton::restore(&migrated).unwrap().snapshot(), migrated);
+    }
+}
+
+#[test]
+fn landscape_renders_the_far_corner_of_the_expanded_world() {
+    use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
+    struct Canvas {
+        pixels: Vec<BinaryColor>,
+    }
+    impl OriginDimensions for Canvas {
+        fn size(&self) -> Size {
+            Size::new(400, 300)
+        }
+    }
+    impl DrawTarget for Canvas {
+        type Color = BinaryColor;
+        type Error = core::convert::Infallible;
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            for Pixel(p, color) in pixels {
+                if (0..400).contains(&p.x) && (0..300).contains(&p.y) {
+                    self.pixels[p.y as usize * 400 + p.x as usize] = color;
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut app = LivingDisplay::new(Settings::default(), 42);
+    app.automaton.set(199, 123, 1);
+    let mut canvas = Canvas {
+        pixels: vec![BinaryColor::On; 400 * 300],
+    };
+    hmi_core::living::render(&mut canvas, &app, &hmi_core::DashboardState::default(), 0).unwrap();
+    for y in [272, 273] {
+        for x in [398, 399] {
+            assert_eq!(canvas.pixels[y * 400 + x], BinaryColor::Off);
+        }
+    }
+    assert_eq!(canvas.pixels[274 * 400 + 399], BinaryColor::On);
+}
+
+#[test]
+fn sparse_methuselah_seed_also_uses_the_new_outer_territory() {
+    let mut a = Automaton::empty(GRID_WIDTH, GRID_HEIGHT, Rule::Life, 42);
+    a.reseed();
+    assert_eq!(a.cell(GRID_WIDTH / 2 - 2, GRID_HEIGHT / 2 - 2), 1);
+    let quadrants = [
+        (10..45, 10..35),
+        (140..175, 10..35),
+        (10..45, 80..110),
+        (140..175, 80..110),
+    ];
+    for (xs, ys) in quadrants {
+        assert!(
+            ys.flat_map(|y| xs.clone().map(move |x| (x, y)))
+                .any(|(x, y)| a.cell(x, y) == 1),
+            "new seed should have life beyond its center"
+        );
+    }
 }

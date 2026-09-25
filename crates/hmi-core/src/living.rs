@@ -14,8 +14,10 @@ use embedded_graphics::{
 
 const INK: BinaryColor = BinaryColor::Off;
 const PAPER: BinaryColor = BinaryColor::On;
-pub const GRID_WIDTH: usize = 100;
-pub const GRID_HEIGHT: usize = 62;
+pub const LEGACY_GRID_WIDTH: usize = 100;
+pub const LEGACY_GRID_HEIGHT: usize = 62;
+pub const GRID_WIDTH: usize = 200;
+pub const GRID_HEIGHT: usize = 124;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rule {
@@ -214,6 +216,9 @@ impl Automaton {
     pub fn cells(&self) -> &[u8] {
         &self.cells
     }
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
     pub fn cell(&self, x: usize, y: usize) -> u8 {
         self.cells[y * self.width + x]
     }
@@ -261,19 +266,23 @@ impl Automaton {
                 for &(x, y) in pattern {
                     self.set(self.width / 2 + x - 3, self.height / 2 + y - 2, 1);
                 }
+                if self.width >= GRID_WIDTH && self.height >= GRID_HEIGHT {
+                    // Four distant, quiet soups give the recognizable core room
+                    // to evolve while putting the newly expanded field to use.
+                    let density = (self.seed_density() * 3 / 4).max(20);
+                    for (left, top) in [(10, 10), (140, 10), (10, 80), (140, 80)] {
+                        for y in top..top + 25 {
+                            for x in left..left + 35 {
+                                let live = self.random() % 100 < density;
+                                self.set(x, y, u8::from(live));
+                            }
+                        }
+                    }
+                }
                 return;
             }
         }
-        let density = match self.rule {
-            Rule::Diamoeba
-            | Rule::Anneal
-            | Rule::Vote
-            | Rule::DayNight
-            | Rule::Coral
-            | Rule::Assimilation => 48,
-            Rule::Seeds | Rule::Replicator => 12,
-            _ => 28,
-        };
+        let density = self.seed_density();
         for i in 0..self.cells.len() {
             self.cells[i] = u8::from(self.random() % 100 < density);
         }
@@ -287,6 +296,48 @@ impl Automaton {
                 }
             }
         }
+    }
+
+    fn seed_density(&self) -> u32 {
+        match self.rule {
+            Rule::Diamoeba
+            | Rule::Anneal
+            | Rule::Vote
+            | Rule::DayNight
+            | Rule::Coral
+            | Rule::Assimilation => 48,
+            Rule::Seeds | Rule::Replicator => 12,
+            _ => 28,
+        }
+    }
+
+    /// Keep the old world centered at the same cell scale. Give its new outer
+    /// territory a sparse, deterministic soup so it can use the expanded field
+    /// immediately without discarding the old cells or generation counter.
+    pub fn into_display_grid(self) -> Option<Self> {
+        if self.dimensions() == (GRID_WIDTH, GRID_HEIGHT) {
+            return Some(self);
+        }
+        if self.dimensions() != (LEGACY_GRID_WIDTH, LEGACY_GRID_HEIGHT) {
+            return None;
+        }
+        let mut expanded = Self::empty(GRID_WIDTH, GRID_HEIGHT, self.rule, self.random);
+        expanded.generation = self.generation;
+        let left = (GRID_WIDTH - self.width) / 2;
+        let top = (GRID_HEIGHT - self.height) / 2;
+        let density = expanded.seed_density() * 3 / 4;
+        for y in 0..GRID_HEIGHT {
+            for x in 0..GRID_WIDTH {
+                let value =
+                    if x >= left && x < left + self.width && y >= top && y < top + self.height {
+                        self.cell(x - left, y - top)
+                    } else {
+                        u8::from(expanded.random() % 100 < density)
+                    };
+                expanded.set(x, y, value);
+            }
+        }
+        Some(expanded)
     }
     pub fn step(&mut self) {
         let (birth, survive) = self.rule.masks();
@@ -468,9 +519,9 @@ impl LivingDisplay {
         self.settings.rule = rule;
     }
     pub fn restore_world(&mut self, world: Automaton) -> bool {
-        if world.width != GRID_WIDTH || world.height != GRID_HEIGHT {
+        let Some(world) = world.into_display_grid() else {
             return false;
-        }
+        };
         let rule = world.rule;
         if rule == self.settings.rule {
             self.automaton = world;
@@ -672,14 +723,13 @@ pub fn render<D: DrawTarget<Color = BinaryColor> + OriginDimensions>(
                 for x in 0..GRID_WIDTH {
                     match app.automaton.cell(x, y) {
                         1 => Rectangle::new(
-                            Point::new((x * 4) as i32, 26 + (y * 4) as i32),
-                            Size::new(3, 3),
+                            Point::new((x * 2) as i32, 26 + (y * 2) as i32),
+                            Size::new(2, 2),
                         )
                         .into_styled(PrimitiveStyle::with_fill(INK))
                         .draw(d)?,
                         2 => {
-                            Pixel(Point::new((x * 4 + 1) as i32, 27 + (y * 4) as i32), INK)
-                                .draw(d)?;
+                            Pixel(Point::new((x * 2) as i32, 26 + (y * 2) as i32), INK).draw(d)?;
                         }
                         _ => {}
                     }

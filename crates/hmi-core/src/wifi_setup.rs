@@ -1,5 +1,5 @@
 //! Bounded form decoding shared by the on-device setup page and host tests.
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Credentials {
@@ -94,6 +94,96 @@ pub fn parse_form(body: &[u8]) -> Option<Credentials> {
     .validate()
 }
 
+/// At most three user-saved networks, plus the compiled fallbacks.
+/// A newly connected network takes priority without erasing older entries.
+pub struct Profiles {
+    saved: Vec<Credentials>,
+    fallbacks: Vec<Credentials>,
+}
+
+impl Profiles {
+    pub fn new(fallback: Credentials) -> Self {
+        Self::with_fallbacks(vec![fallback])
+    }
+
+    pub fn with_fallbacks(fallbacks: Vec<Credentials>) -> Self {
+        Self {
+            saved: Vec::new(),
+            fallbacks: fallbacks
+                .into_iter()
+                .filter_map(Credentials::validate)
+                .collect(),
+        }
+    }
+
+    pub fn decode(blob: &[u8], fallbacks: Vec<Credentials>) -> Self {
+        let mut profiles = Self::with_fallbacks(fallbacks);
+        if blob.first() == Some(&1) {
+            if let Some(legacy) = Credentials::decode(blob) {
+                profiles.promote(legacy);
+            }
+            return profiles;
+        }
+        if blob.len() < 2 || blob[0] != 2 || blob[1] > 3 {
+            return profiles;
+        }
+        let mut offset = 2;
+        let mut entries = Vec::new();
+        for _ in 0..blob[1] {
+            let Some(header) = blob.get(offset..offset + 2) else {
+                return profiles;
+            };
+            let length = 3 + header[0] as usize + header[1] as usize;
+            let mut encoded = Vec::with_capacity(length);
+            encoded.push(1);
+            encoded.extend_from_slice(&blob[offset..offset + 2]);
+            offset += 2;
+            let Some(content) = blob.get(offset..offset + length - 3) else {
+                return profiles;
+            };
+            encoded.extend_from_slice(content);
+            let Some(entry) = Credentials::decode(&encoded) else {
+                return profiles;
+            };
+            entries.push(entry);
+            offset += length - 3;
+        }
+        if offset != blob.len() {
+            return profiles;
+        }
+        // Reverse because promote inserts at the front.
+        for entry in entries.into_iter().rev() {
+            profiles.promote(entry);
+        }
+        profiles
+    }
+
+    pub fn promote(&mut self, entry: Credentials) {
+        self.saved.retain(|old| old.ssid != entry.ssid);
+        self.saved.insert(0, entry);
+        self.saved.truncate(3);
+    }
+
+    pub fn ordered(&self) -> Vec<Credentials> {
+        let mut networks = self.saved.clone();
+        for fallback in &self.fallbacks {
+            if !networks.iter().any(|item| item.ssid == fallback.ssid) {
+                networks.push(fallback.clone());
+            }
+        }
+        networks
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut blob = vec![2, self.saved.len() as u8];
+        for entry in &self.saved {
+            let encoded = entry.encode();
+            blob.extend_from_slice(&encoded[1..]);
+        }
+        blob
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +209,79 @@ mod tests {
         assert_eq!(Credentials::decode(&blob), Some(parsed));
         assert!(Credentials::decode(&blob[..blob.len() - 1]).is_none());
         assert!(Credentials::decode(&[0, 1, 0, b'a']).is_none());
+    }
+
+    #[test]
+    fn new_home_network_preserves_previous_one_and_roundtrips() {
+        let original = Credentials {
+            ssid: "Original_2G".into(),
+            password: "original-pass".into(),
+        };
+        let alternate = Credentials {
+            ssid: "ExampleHome_2G".into(),
+            password: "another-pass".into(),
+        };
+        let mut profiles = Profiles::new(original.clone());
+        assert_eq!(profiles.ordered(), [original.clone()]);
+        profiles.promote(alternate.clone());
+        assert_eq!(profiles.ordered(), [alternate.clone(), original.clone()]);
+        let restored = Profiles::decode(&profiles.encode(), vec![original.clone()]);
+        assert_eq!(restored.ordered(), profiles.ordered());
+        profiles.promote(original.clone());
+        assert_eq!(profiles.ordered(), [original.clone(), alternate]);
+    }
+
+    #[test]
+    fn old_format_and_corruption_do_not_delete_compiled_fallback() {
+        let fallback = Credentials {
+            ssid: "factory".into(),
+            password: "factorypass".into(),
+        };
+        let saved = Credentials {
+            ssid: "saved".into(),
+            password: "savedpass".into(),
+        };
+        assert_eq!(
+            Profiles::decode(&saved.encode(), vec![fallback.clone()]).ordered(),
+            [saved.clone(), fallback.clone()]
+        );
+        for invalid in [&[][..], &[2, 4], &[2, 1, 4, 8, 0, 1], &[9, 0]] {
+            assert_eq!(
+                Profiles::decode(invalid, vec![fallback.clone()]).ordered(),
+                [fallback.clone()]
+            );
+        }
+        let mut profiles = Profiles::new(fallback);
+        for i in 0..6 {
+            profiles.promote(Credentials {
+                ssid: format!("test{i}"),
+                password: "12345678".into(),
+            });
+        }
+        assert_eq!(profiles.ordered().len(), 4);
+    }
+
+    #[test]
+    fn two_compiled_networks_and_saved_one_survive_reorder() {
+        let primary = Credentials {
+            ssid: "main".into(),
+            password: "mainpassword".into(),
+        };
+        let secondary = Credentials {
+            ssid: "backup".into(),
+            password: "backuppassword".into(),
+        };
+        let added = Credentials {
+            ssid: "guest".into(),
+            password: "guestpassword".into(),
+        };
+        let mut profiles = Profiles::with_fallbacks(vec![primary.clone(), secondary.clone()]);
+        assert_eq!(profiles.ordered(), [primary.clone(), secondary.clone()]);
+        profiles.promote(added.clone());
+        assert_eq!(
+            Profiles::decode(&profiles.encode(), vec![primary.clone(), secondary.clone()])
+                .ordered(),
+            [added, primary, secondary]
+        );
     }
 }

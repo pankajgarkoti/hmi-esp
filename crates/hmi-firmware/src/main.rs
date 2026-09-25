@@ -55,7 +55,7 @@ mod firmware {
     use hmi_core::living::{self, LivingDisplay, Rule, Settings};
     use hmi_core::sounds::{Cue, SoundDetector};
     use hmi_core::usb_commands::{Command, UsbCommands};
-    use hmi_core::wifi_setup::Credentials;
+    use hmi_core::wifi_setup::{Credentials, Profiles};
     use hmi_core::{
         BatteryTelemetry, Button, ButtonEngine, ClockTelemetry, DashboardState,
         EnvironmentTelemetry, FileEntry, FileKind, Health, UiAction, View,
@@ -90,6 +90,8 @@ mod firmware {
         "HMI_WIFI_PASSWORD",
         "set WIFI_PASSWORD in the ignored .env.local"
     );
+    const WIFI_EXTRA_SSID: Option<&str> = option_env!("HMI_WIFI_EXTRA_SSID");
+    const WIFI_EXTRA_PASSWORD: Option<&str> = option_env!("HMI_WIFI_EXTRA_PASSWORD");
     const TIMEZONE: &str = "IST-5:30";
     const TIMEZONE_LABEL: &str = "IST";
     // The codec chunk is 256 stereo frames (10.67 ms at 24 kHz). The vendor
@@ -120,17 +122,31 @@ mod firmware {
             ssid: WIFI_SSID.into(),
             password: WIFI_PASSWORD.into(),
         };
-        let mut current_wifi = wifi_preferences
+        let mut fallbacks = Vec::new();
+        if let (Some(ssid), Some(password)) = (WIFI_EXTRA_SSID, WIFI_EXTRA_PASSWORD) {
+            fallbacks.push(Credentials {
+                ssid: ssid.into(),
+                password: password.into(),
+            });
+        }
+        fallbacks.push(fallback_wifi);
+        let mut profiles = wifi_preferences
             .as_ref()
             .and_then(|prefs| {
-                let mut blob = [0u8; 100];
+                let mut blob = [0u8; 400];
                 prefs
                     .get_blob("network", &mut blob)
                     .ok()
                     .flatten()
-                    .and_then(Credentials::decode)
+                    .map(|bytes| Profiles::decode(bytes, fallbacks.clone()))
             })
-            .unwrap_or(fallback_wifi);
+            .unwrap_or_else(|| Profiles::with_fallbacks(fallbacks));
+        let mut profile_index = 0usize;
+        let mut current_wifi = profiles
+            .ordered()
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No valid initial Wi-Fi network"))?;
         let settings = preferences
             .as_ref()
             .and_then(|p| p.get_u32("settings").ok().flatten())
@@ -473,15 +489,19 @@ mod firmware {
                     .unwrap_or(false);
                 if connected {
                     if let Some(prefs) = wifi_preferences.as_ref() {
-                        match prefs.set_blob("network", &credentials.encode()) {
+                        profiles.promote(credentials.clone());
+                        match prefs.set_blob("network", &profiles.encode()) {
                             Ok(()) => {
                                 current_wifi = credentials;
+                                profile_index = 0;
                                 state.wifi.ssid = current_wifi.ssid.clone();
                                 living.wifi_message = "CONNECTED / NETWORK SAVED";
                                 info!("Wi-Fi setup connected and saved");
                             }
                             Err(err) => {
                                 warn!("Wi-Fi setup NVS save failed: {err}");
+                                current_wifi = credentials;
+                                profile_index = 0;
                                 living.wifi_message = "CONNECTED / SAVE FAILED";
                             }
                         }
@@ -622,7 +642,15 @@ mod firmware {
                 sample_storage(&mut state, now_ms);
             }
             if !living.wifi_setup_active {
-                update_wifi(&mut wifi, &mut state, now_ms, &mut last_wifi_retry);
+                update_wifi(
+                    &mut wifi,
+                    &mut state,
+                    now_ms,
+                    &mut last_wifi_retry,
+                    &profiles,
+                    &mut profile_index,
+                    &mut current_wifi,
+                );
             }
             update_runtime(&mut state);
             if now_ms.saturating_sub(last_runtime_event) >= RUNTIME_EVENT_MS {
@@ -1002,6 +1030,9 @@ mod firmware {
         state: &mut DashboardState,
         now_ms: u64,
         last_retry: &mut u64,
+        profiles: &Profiles,
+        profile_index: &mut usize,
+        current: &mut Credentials,
     ) {
         let Some(wifi) = wifi.as_mut() else { return };
         if wifi.is_up().unwrap_or(false) {
@@ -1024,9 +1055,17 @@ mod firmware {
             if now_ms.saturating_sub(*last_retry) >= WIFI_RETRY_MS {
                 *last_retry = now_ms;
                 state.wifi.reconnects = state.wifi.reconnects.saturating_add(1);
-                let _ = wifi.disconnect();
-                if let Err(err) = wifi.connect() {
-                    warn!("Wi-Fi reconnect failed: {err}");
+                let options = profiles.ordered();
+                if !options.is_empty() {
+                    *profile_index = (*profile_index + 1) % options.len();
+                    *current = options[*profile_index].clone();
+                    state.wifi.ssid = current.ssid.clone();
+                    info!(
+                        "Wi-Fi trying profile {} of {}",
+                        *profile_index + 1,
+                        options.len()
+                    );
+                    restore_wifi(wifi, current);
                 }
             }
         }

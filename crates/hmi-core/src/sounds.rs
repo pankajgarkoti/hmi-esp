@@ -192,15 +192,21 @@ impl SoundDetector {
         {
             Some(Cue::Snap)
         } else if (6..=65).contains(&length) {
-            let mut distance = 1.;
-            if !self.learned.is_empty() {
-                distance = template_distance(&self.frames, &self.learned);
-            }
+            let learned_distance = if self.learned.is_empty() {
+                1.
+            } else {
+                template_distance(&self.frames, &self.learned)
+            };
+            let mut preset_distance: f32 = 1.;
             for preset in presets::TIME {
-                distance = distance.min(template_distance(&self.frames, preset));
+                preset_distance = preset_distance.min(template_distance(&self.frames, preset));
             }
-            self.last_distance = distance;
-            if distance < 0.22 {
+            self.last_distance = preset_distance.min(learned_distance);
+            // Short background noises can resemble one or two spectral frames
+            // of "time". Require a full utterance for built-in voice examples;
+            // a personally learned cue may be shorter but needs a closer match.
+            if (length >= 16 && preset_distance < 0.22) || (length >= 8 && learned_distance < 0.18)
+            {
                 Some(Cue::Time)
             } else {
                 None

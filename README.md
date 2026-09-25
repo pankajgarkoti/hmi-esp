@@ -36,6 +36,7 @@ Build and flash (requires the `esp` Rust toolchain, `ldproxy`, CMake, Ninja, Pyt
 
 ```sh
 # .env.local: WIFI_SSID=... and WIFI_PASSWORD=... (no surrounding quotes)
+# Optional preferred second network: WIFI_EXTRA_SSID=... and WIFI_EXTRA_PASSWORD=...
 ./scripts/vendor-sync.sh
 . ~/export-esp.sh
 ./scripts/build-firmware.sh

@@ -17,6 +17,12 @@ fn main() {
             match key.trim() {
                 "WIFI_SSID" => println!("cargo:rustc-env=HMI_WIFI_SSID={}", value.trim()),
                 "WIFI_PASSWORD" => println!("cargo:rustc-env=HMI_WIFI_PASSWORD={}", value.trim()),
+                "WIFI_EXTRA_SSID" => {
+                    println!("cargo:rustc-env=HMI_WIFI_EXTRA_SSID={}", value.trim())
+                }
+                "WIFI_EXTRA_PASSWORD" => {
+                    println!("cargo:rustc-env=HMI_WIFI_EXTRA_PASSWORD={}", value.trim())
+                }
                 _ => {}
             }
         }

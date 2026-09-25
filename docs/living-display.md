@@ -42,8 +42,16 @@ battery fuel gauge.
    (typically `http://192.168.71.1`; the actual AP address is read at runtime).
 3. Enter the desired 2.4 GHz Wi-Fi SSID and password. The temporary AP closes
    after submission; the board tries the new network and saves its credentials
-   in NVS only after obtaining an address. If it fails, the previous network is
-   restored. Hold/select the setup row again to retry.
+   in NVS only after obtaining an address. Previous profiles are retained as
+   fallback choices. If joining fails, the previous network is restored.
+   Hold/select the setup row again to retry.
+
+For a build with two local fallback networks, set `WIFI_SSID`/`WIFI_PASSWORD`
+and optional `WIFI_EXTRA_SSID`/`WIFI_EXTRA_PASSWORD` in the ignored `.env.local`.
+The optional extra is attempted first; on a failed connection the device rotates
+through the other saved and compiled networks every 15 seconds. A successfully
+provisioned network takes precedence. Credentials are embedded in a local build
+and NVS, never in the public source tree.
 
 The temporary WPA2 AP is enabled only on explicit physical setup and ends after
 three minutes or a KEY press. The HTTP form is served only in AP mode and uses no
